@@ -1,0 +1,106 @@
+evcc> show
+  state    : CHARGE
+  proximity: EVSE Connected and locked
+  OUT1     : OFF - LED
+  OUT2     : OFF - EVSEDISC
+  OUT3     : OFF - BUZZER
+  charger  : tsm2500   
+    status : 28902 msgs sent; 28546 msgs received
+    voltage:   54.4V
+    current:   27.5A
+    charge : 6024Wh
+  uptime   : 432 hour(s), 3 minute(s), 58 second(s)
+evcc> show config
+  bms      : none
+  canbr    : 250kbps
+  OUT1     : LED
+  OUT2     : EVSEDISC
+  OUT3     : BUZZER
+  charger  : tsm2500   
+  maxv     :  56.8V   
+  maxc     :  40.0A   
+  termc    :   0.1A   
+  termt    : 672.0hr  
+  fin_maxv :  54.1V   
+  fin_maxc :   2.0A   
+  fin_termt:   1.0hr  
+  flt_maxv :  54.0V   
+  flt_maxc :   2.0A   
+  flt_termt:   inf    
+  options  : canterm (CAN termination resistor enabled)
+
+
+tom@DuBadger:~/Documents/PlatformIO/Projects/EVCC-to-MQTT-Bridge$ ssh charger
+picocom v3.1
+
+port is        : /dev/charger
+flowcontrol    : none
+baudrate is    : 9600
+parity is      : none
+databits are   : 8
+stopbits are   : 1
+escape is      : C-a
+local echo is  : no
+noinit is      : no
+noreset is     : no
+hangup is      : no
+nolock is      : no
+send_cmd is    : sz -vv
+receive_cmd is : rz -vv -E
+imap is        : 
+omap is        : 
+emap is        : crcrlf,delbs,
+logfile is     : none
+initstring     : none
+exit_after is  : not set
+exit is        : no
+
+Type [C-a] [C-h] to see available commands
+Terminal ready
+
+evcc> show
+  state    : DRIVE
+  proximity: EVSE not connected
+  OUT1     : ON  - LED
+  OUT2     : ON  - EVSEDISC
+  OUT3     : OFF - BUZZER
+  uptime   : 15 hour(s), 54 minute(s), 50 second(s)
+evcc> show config
+  bms      : none
+  canbr    : 250kbps
+  OUT1     : LED
+  OUT2     : EVSEDISC
+  OUT3     : BUZZER
+  charger  : tsm2500   
+  maxv     :  56.8V   
+  maxc     : 100.0A   
+  termc    :   0.1A   
+  termt    : 672.0hr  
+  fin_maxv :  54.1V   
+  fin_maxc :   2.0A   
+  fin_termt:   1.0hr  
+  flt_maxv :  54.0V   
+  flt_maxc :   2.0A   
+  flt_termt:   inf    
+  options  : canterm (CAN termination resistor enabled)
+evcc> show history
+      |   term   |  charge |          |   watt | maximum| maximum|  ending|
+  num |  reason  |   time  |  charger |  hours | voltage| current| current|
+--------------------------------------------------------------------------
+ last | EVSE disc| 313 mins|tsm2500   |  7671Wh|  57.0V |  28.2A |   0.0A |
+  - 1 | EVSE disc| 254 mins|tsm2500   |  6175Wh|  54.4V |  28.5A |   0.0A |
+  - 2 | EVSE disc|   9 mins|tsm2500   |   215Wh|  54.2V |  28.1A |   0.0A |
+  - 3 | comm err |   0 mins|tsm2500   |     0Wh|   0.0V |   0.0A |   0.0A |
+  - 4 | EVSE disc| 174 mins|tsm2500   |  4334Wh|  54.8V |  28.5A |   0.0A |
+  - 5 | comm err | 250 mins|tsm2500   |  6225Wh|  54.5V |  28.8A |   0.0A |
+  - 6 | comm err |   7 mins|tsm2500   |   171Wh|  57.1V |  27.5A |   0.0A |
+  - 7 | EVSE disc| 244 mins|tsm2500   |  6085Wh|  55.1V |  28.1A |   0.0A |
+  - 8 | EVSE disc| 243 mins|tsm2500   |  6069Wh|  54.3V |  28.3A |   0.0A |
+  - 9 | EVSE disc| 203 mins|tsm2500   |  5081Wh|  53.9V |  29.0A |   0.0A |
+  -10 | comm err |  13 mins|tsm2500   |   300Wh|  53.4V |  28.6A |   0.0A |
+  -11 | EVSE disc|   0 mins|tsm2500   |     0Wh|  57.6V |   0.6A |   0.0A |
+  -12 | EVSE disc|   0 mins|tsm2500   |     0Wh|  57.4V |   0.6A |   0.0A |
+  -13 | EVSE disc|   0 mins|tsm2500   |     0Wh|  57.7V |   0.6A |   0.0A |
+  -14 | EVSE disc|   0 mins|tsm2500   |     0Wh|  57.6V |   0.6A |   0.0A |
+  -15 | EVSE disc|   1 mins|tsm2500   |     0Wh|  57.6V |   0.6A |   0.0A |
+evcc> 

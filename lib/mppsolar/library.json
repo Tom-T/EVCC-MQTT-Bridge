@@ -1,0 +1,25 @@
+{
+  "name": "mppsolar",
+  "version": "1.0.0",
+  "description": "A library to interact with the mpp solar serial interface for the LV5048.",
+  "keywords": ["mppsolar", "LV5048"],
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/username/hello-world.git"
+  },
+  "authors":
+  [
+    {
+      "name": "Tom Tijerina",
+      "email": "ham.arduino@tomt.me",
+      "maintainer": true
+    }
+  ],
+  "dependencies": {
+    "CircularBuffer": "1.3.3", 
+    "EspSoftwareSerial":"6.8.5"
+  },
+  "frameworks": "*",
+  "platforms": "*"
+}

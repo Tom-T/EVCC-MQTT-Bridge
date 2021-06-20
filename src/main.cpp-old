@@ -1,0 +1,477 @@
+#include <Arduino.h>
+
+#include <ESP8266WiFi.h>
+#include <Ticker.h>
+#include <AsyncMqttClient.h>
+#include <ArduinoJson.h>
+#include <settings.h>
+
+// TODO For some commands can simply return true/false if they got ACK or NAK. If they got NAK, should exhaust retries first.
+// Sendcommand vs GetData
+int prev_millis;
+unsigned long prev_QPIGS_millis = 0, prev_QPIGS2_millis = 0, prev_QPIWS_millis = 0, prev_QPIRI_millis = 0;
+
+//Inverter settings
+SoftwareSerial InverterSerialPort(SerialRxPin, SerialTxPin);
+mppsolar inverter(InverterSerialPort);
+
+//Wifi Settings
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker wifiReconnectTimer;
+
+//MQTT Broker
+AsyncMqttClient mqttClient;
+Ticker mqttReconnectTimer;
+
+//Battery Cell settings
+int cellLowest = 0;
+int cellHighest = 0xffff;
+bool bypass = false;
+bool bmsLock = true;
+bool BMStriggers = true;
+unsigned long bmsLast = 0;
+unsigned long bmsinterval = 100;
+unsigned long bmsTimeout = 30000;
+
+char mqttBuffer[255];
+StaticJsonDocument<200> doc;
+
+uint16_t postMQTT(String name, String value);
+void MQTTValues();
+bool strtob(char input);
+void onDiyBms(char *data, int len);
+
+void connectToWifi();
+void connectToMqtt();
+void onWifiConnect(const WiFiEventStationModeGotIP &event);
+void onWifiDisconnect(const WiFiEventStationModeDisconnected &event);
+
+void onMqttConnect(bool sessionPresent);
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
+void onMqttPublish(uint16_t packetId);
+void onMqttSubscribe(uint16_t packetId, uint8_t qos);
+void onMqttUnsubscribe(uint16_t packetId);
+void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total);
+
+void setup()
+{
+    Serial.begin(19200);
+    wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+    wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+    mqttClient.setCredentials(MQTT_USER, MQTT_PASSWORD);
+    mqttClient.onConnect(onMqttConnect);
+    mqttClient.onDisconnect(onMqttDisconnect);
+    mqttClient.onSubscribe(onMqttSubscribe);
+    mqttClient.onUnsubscribe(onMqttUnsubscribe);
+    mqttClient.onPublish(onMqttPublish);
+    mqttClient.onMessage(onMqttMessage);
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    connectToWifi();
+}
+
+void loop()
+{
+    if ((millis() - bmsLast > bmsTimeout) && (bmsLock == false))
+    {
+        bmsLock = true;
+        Serial.println("Automatic cutoff triggered");
+    }
+    if (BMStriggers && (millis() - bmsLast > bmsinterval))
+    {
+        BMStriggers = false;
+        Serial.println("BMS triggers");
+    }
+    MQTTValues();
+
+    inverter.Loop(); //Let the inverter interface run its required cycles.
+
+    if ((millis() - prev_millis > bmsTimeout))
+    {
+        // inverter.Send("QPIRI");
+
+        // Serial.println("about to send QID");
+
+        // inverter.Send("QID");
+        // inverter.Send("QPGS");
+
+        prev_millis = millis();
+    }
+    // Receive information on Serial from MPPT
+    if (inverter.ResponseReady)
+    {
+        inverter.ResponseReady = false;
+        Serial.println("Reponse ready");
+        Serial.println(inverter.Response);
+    }
+}
+
+void connectToWifi()
+{
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void connectToMqtt()
+{
+    Serial.println("Connecting to MQTT...");
+    mqttClient.connect();
+}
+
+void onWifiConnect(const WiFiEventStationModeGotIP &event)
+{
+    Serial.println("Connected to Wi-Fi.");
+    connectToMqtt();
+}
+
+void onWifiDisconnect(const WiFiEventStationModeDisconnected &event)
+{
+    Serial.println("Disconnected from Wi-Fi.");
+    mqttReconnectTimer.detach(); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+    wifiReconnectTimer.once(2, connectToWifi);
+}
+
+void onMqttConnect(bool sessionPresent)
+{
+
+    Serial.println("Connected to MQTT.");
+    mqttClient.subscribe("esp/bme280/temperature", 0);
+    mqttClient.subscribe("diybms/+/+", 0);
+    char TopicString[50];
+    sprintf(TopicString, "%s/setter/+", MQTT_TOPIC);
+    mqttClient.subscribe(TopicString, 1);
+    Serial.print("Session present: ");
+    Serial.println(sessionPresent);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
+{
+    Serial.println("Disconnected from MQTT.");
+
+    if (WiFi.isConnected())
+    {
+        mqttReconnectTimer.once(2, connectToMqtt);
+    }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos)
+{
+    Serial.println("Subscribe acknowledged.");
+    Serial.print("  packetId: ");
+    Serial.println(packetId);
+    Serial.print("  qos: ");
+    Serial.println(qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId)
+{
+    Serial.println("Unsubscribe acknowledged.");
+    Serial.print("  packetId: ");
+    Serial.println(packetId);
+}
+void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
+{
+    memcpy(mqttBuffer + index, payload, len);
+    if (len + index != total)
+    {
+        return;
+    }
+    else
+    {
+        mqttBuffer[total] = 0;
+    }
+    //TODO: Fix this obvious security flaw!
+    char TopicString[50];
+    sprintf(TopicString, "%s/setter/", MQTT_TOPIC);
+    
+    String command = String(topic).substring(String(TopicString).length());
+    if (String(topic).startsWith(String(TopicString))) {
+        Serial.print("Topic: ");
+        Serial.println(command);
+        Serial.print("Got Command: ");
+        Serial.println(mqttBuffer);
+        //TODO Add this and the response to inverter serial port.
+
+    }
+    else if (String(topic).startsWith("diybms"))
+    {
+        onDiyBms(mqttBuffer, total);
+    }
+    else if (String(topic).endsWith("temperature"))
+    {
+        Serial.print("Got temp ");
+        Serial.println(mqttBuffer);
+    }
+    else
+    {
+
+        Serial.println("Publish received.");
+        Serial.print("  topic: ");
+        Serial.println(topic);
+        Serial.print("  qos: ");
+        Serial.println(properties.qos);
+        Serial.print("  dup: ");
+        Serial.println(properties.dup);
+        Serial.print("  retain: ");
+        Serial.println(properties.retain);
+        Serial.print("  len: ");
+        Serial.println(len);
+        Serial.print("  index: ");
+        Serial.println(index);
+        Serial.print("  total: ");
+        Serial.println(total);
+        Serial.print(" message: ");
+        Serial.println(mqttBuffer);
+    }
+}
+
+void onMqttPublish(uint16_t packetId)
+{
+    return;
+    // Serial.print("Publish acknowledged.");
+    // Serial.print("  packetId: ");
+    // Serial.println(packetId);
+}
+
+void onDiyBms(char *data, int len)
+{
+    // Deserialize the JSON document
+    DeserializationError error = deserializeJson(doc, data);
+
+    // Test if parsing succeeds.
+    if (error)
+    {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.c_str());
+        return;
+    }
+
+    if (millis() - bmsLast > bmsinterval)
+    {
+        if (cellLowest != 0)
+        {
+            Serial.println("Resetting the bms timer");
+        }
+        cellLowest = 0;
+        cellHighest = 0xffff;
+        bypass = false;
+    }
+
+    bmsLast = millis();
+    bmsLock = false;
+    BMStriggers = true;
+
+    String voltage = doc["voltage"];
+    bool bypassinput = doc["bypass"];
+    voltage.remove(voltage.indexOf("."), 1);
+    int number = voltage.toInt();
+    if (voltage.length() == 3)
+    {
+        number *= 10;
+    }
+    if (voltage.length() == 2)
+    {
+        number *= 100;
+    }
+    if (voltage.length() == 1)
+    {
+        number *= 1000;
+    }
+    if (cellLowest > number || cellLowest == 0)
+    {
+        Serial.print("Lowest was: ");
+        Serial.print(cellLowest);
+        Serial.print(" It is now: ");
+        Serial.println(number);
+        cellLowest = number;
+    }
+    if (cellHighest < number || cellHighest == 0xffff)
+    {
+        Serial.print("Highest was: ");
+        Serial.print(cellHighest);
+        Serial.print(" It is now: ");
+        Serial.println(number);
+        cellHighest = number;
+    }
+
+    if (bypassinput)
+    {
+        Serial.println("Bypass is now active");
+        bypass = bypassinput;
+    }
+}
+void Myprintf(const char *string, const float value)
+{
+    char s[100];
+    sprintf(s, "%s\t%.2f\r\n", string, value);
+    Serial.write(s);
+}
+void Myprinti(const char *string, const int value)
+{
+    char s[100];
+    sprintf(s, "%s\t%d\r\n", string, value);
+    Serial.write(s);
+}
+void Myprintb(const char *string, const bool value)
+{
+    char s[100];
+    sprintf(s, "%s\tFalse\r\n", string);
+    if (value)
+    {
+        sprintf(s, "%s\tTrue\r\n", string);
+    }
+    Serial.write(s);
+}
+
+bool strtob(char input)
+{
+    if (input == '1')
+    {
+        return true;
+    }
+    return false;
+}
+
+uint16_t postMQTT(String name, String value)
+{
+    char TopicString[50];
+    sprintf(TopicString, "%s/%s", MQTT_TOPIC, name.c_str());
+    int packetID = mqttClient.publish(TopicString, 0, true, value.c_str());
+    // delay(5); //TODO: Correct this ugly fix.
+    return packetID;
+}
+void MQTTValues()
+{
+    if (prev_QPIRI_millis != inverter.QPIRI_millis)
+    {
+        prev_QPIRI_millis = inverter.QPIRI_millis;
+
+        postMQTT("Settings/ACInputVoltage", String(inverter.Settings_ACInputVoltage));
+        postMQTT("Settings/ACInputCurrent", String(inverter.Settings_ACInputCurrent));
+        postMQTT("Settings/ACOutputVoltage", String(inverter.Settings_ACOutputVoltage));
+        postMQTT("Settings/ACOutputFrequency", String(inverter.Settings_ACOutputFrequency));
+        postMQTT("Settings/ACOutputCurrent", String(inverter.Settings_ACOutputCurrent));
+        postMQTT("Settings/ACOutputApparentPower", String(inverter.Settings_ACOutputApparentPower));
+        postMQTT("Settings/ACOutputActivePower", String(inverter.Settings_ACOutputActivePower));
+        postMQTT("Settings/BatteryVoltage", String(inverter.Settings_BatteryVoltage));
+        postMQTT("Settings/BatteryRechargeVoltage", String(inverter.Settings_BatteryRechargeVoltage));
+        postMQTT("Settings/BatteryUnderVoltage", String(inverter.Settings_BatteryUnderVoltage));
+        postMQTT("Settings/BatteryBulkChargeVoltage", String(inverter.Settings_BatteryBulkChargeVoltage));
+        postMQTT("Settings/BatteryFloatChargeVoltage", String(inverter.Settings_BatteryFloatChargeVoltage));
+        postMQTT("Settings/BatteryType", String(inverter.Settings_BatteryType));
+        postMQTT("Settings/MaxACChargingCurrent", String(inverter.Settings_MaxACChargingCurrent));
+        postMQTT("Settings/MaxChargingCurrent", String(inverter.Settings_MaxChargingCurrent));
+        postMQTT("Settings/InputVoltageRange", String(inverter.Settings_InputVoltageRange));
+        postMQTT("Settings/OutputSourcePriority", String(inverter.Settings_OutputSourcePriority));
+        postMQTT("Settings/ChargerSourcePriority", String(inverter.Settings_ChargerSourcePriority));
+        postMQTT("Settings/MaxParallelUnits", String(inverter.Settings_MaxParallelUnits));
+        postMQTT("Settings/MachineType", String(inverter.Settings_MachineType));
+        postMQTT("Settings/Topology", String(inverter.Settings_Topology));
+        postMQTT("Settings/OutputMode", String(inverter.Settings_OutputMode));
+        postMQTT("Settings/BatteryRedischargeVoltage", String(inverter.Settings_BatteryRedischargeVoltage));
+        postMQTT("Settings/PVOKCondition", String(inverter.Settings_PVOKCondition));
+        postMQTT("Settings/PVPowerBalance", String(inverter.Settings_PVPowerBalance));
+        postMQTT("Settings/MaxChargingTimeatCVStage", String(inverter.Settings_MaxChargingTimeatCVStage));
+    }
+
+    if ((prev_QPIGS2_millis != inverter.QPIGS2_millis) || (prev_QPIGS_millis != inverter.QPIGS_millis))
+    {
+        postMQTT("Total/acOutputApparentPower", String(inverter.L2acOutputApparentPower + inverter.acOutputApparentPower));
+        postMQTT("Total/acOutputActivePower", String(inverter.L2acOutputActivePower + inverter.acOutputActivePower));
+        postMQTT("Total/acOutputLoad", String(inverter.L2acOutputLoad + inverter.acOutputLoad));
+        postMQTT("Total/pvbatteryChargingCurrent", String(inverter.pv2batteryChargingCurrent + inverter.batteryChargingCurrent));
+        postMQTT("Total/pvInputCurrent", String(inverter.pv2InputCurrent + inverter.pvInputCurrent));
+    }
+
+    if (prev_QPIGS_millis != inverter.QPIGS_millis)
+    {
+        prev_QPIGS_millis = inverter.QPIGS_millis;
+        postMQTT("0/acInputFrequency", String(inverter.acInputFrequency));
+        postMQTT("0/acOutputVoltage", String(inverter.acOutputVoltage));
+        postMQTT("0/acOutputFrequency", String(inverter.acOutputFrequency));
+        postMQTT("0/acOutputApparentPower", String(inverter.acOutputApparentPower));
+        postMQTT("0/acOutputActivePower", String(inverter.acOutputActivePower));
+        postMQTT("0/acOutputLoad", String(inverter.acOutputLoad));
+        postMQTT("0/batteryChargingCurrent", String(inverter.batteryChargingCurrent));
+        postMQTT("0/pvInputPower", String(inverter.pvInputPower));
+        postMQTT("0/batteryVoltage", String(inverter.batteryVoltage));
+
+        postMQTT("0/batteryCapacity", String(inverter.batteryCapacity));
+
+        postMQTT("0/issccChargingOn", String(inverter.issccChargingOn));
+        postMQTT("0/isacChargingOn", String(inverter.isacChargingOn));
+
+        postMQTT("0/inverterHeatSinkTempature", String(inverter.inverterHeatSinkTempature));
+        postMQTT("0/pvInputCurrent", String(inverter.pvInputCurrent));
+        postMQTT("0/pvInputVoltage", String(inverter.pvInputVoltage));
+        postMQTT("0/batteryVoltageFromscc", String(inverter.batteryVoltageFromscc));
+        postMQTT("0/batteryDischargeCurrent", String(inverter.batteryDischargeCurrent));
+        postMQTT("0/issbuPriorityVersionAdded", String(inverter.issbuPriorityVersionAdded));
+        postMQTT("0/isConfigurationChanged", String(inverter.isConfigurationChanged));
+        postMQTT("0/issccFirmwareUpdated", String(inverter.issccFirmwareUpdated));
+        postMQTT("0/loadOn", String(inverter.loadOn));
+        postMQTT("0/isBatteryVoltageToSteadyWhileCharging", String(inverter.isBatteryVoltageToSteadyWhileCharging));
+        postMQTT("0/isCharginOn", String(inverter.isCharginOn));
+
+        postMQTT("0/RSV1", String(inverter.RSV1));
+        postMQTT("0/RSV2", String(inverter.RSV2));
+        postMQTT("0/isChargingTofloat", String(inverter.isChargingTofloat));
+        postMQTT("0/isSwitchedON", String(inverter.isSwitchedON));
+        postMQTT("0/isReserved", String(inverter.isReserved));
+
+        postMQTT("Total/busVoltage", String(inverter.busVoltage));
+    }
+    if (prev_QPIGS2_millis != inverter.QPIGS2_millis)
+    {
+        prev_QPIGS2_millis = inverter.QPIGS2_millis;
+        postMQTT("1/L2acInputVoltage", String(inverter.L2acInputVoltage));
+        postMQTT("1/L2acInputFrequency", String(inverter.L2acInputFrequency));
+        postMQTT("1/L2acOutputVoltage", String(inverter.L2acOutputVoltage));
+        postMQTT("1/L2acOutputFrequency", String(inverter.L2acOutputFrequency));
+        postMQTT("1/L2acOutputApparentPower", String(inverter.L2acOutputApparentPower));
+        postMQTT("1/L2acOutputActivePower", String(inverter.L2acOutputActivePower));
+        postMQTT("1/L2acOutputLoad", String(inverter.L2acOutputLoad));
+        postMQTT("1/pv2batteryChargingCurrent", String(inverter.pv2batteryChargingCurrent));
+        postMQTT("1/pv2InputCurrent", String(inverter.pv2InputCurrent));
+        postMQTT("1/L2batteryVoltage", String(inverter.L2batteryVoltage));
+
+        postMQTT("1/isL2sccOk", String(inverter.isL2sccOk));
+        postMQTT("1/isL2ACChargingOn", String(inverter.isL2ACChargingOn));
+        postMQTT("1/isL2SccChargingOn", String(inverter.isL2SccChargingOn));
+        postMQTT("1/isL2LineNotOk", String(inverter.isL2LineNotOk));
+        postMQTT("1/isL2LoadOn", String(inverter.isL2LoadOn));
+    }
+    if (prev_QPIWS_millis != inverter.QPIWS_millis)
+    {
+        prev_QPIWS_millis = inverter.QPIWS_millis;
+        postMQTT("Warnings/InverterFault", String(inverter.InverterFault));
+        postMQTT("Warnings/BusOverFault", String(inverter.BusOverFault));
+        postMQTT("Warnings/BusUnderFault", String(inverter.BusUnderFault));
+        postMQTT("Warnings/BusSoftFailFault", String(inverter.BusSoftFailFault));
+        postMQTT("Warnings/LineFailWarning", String(inverter.LineFailWarning));
+        postMQTT("Warnings/OPVshortWarning", String(inverter.OPVshortWarning));
+        postMQTT("Warnings/InverterVoltageTooLowFault", String(inverter.InverterVoltageTooLowFault));
+        postMQTT("Warnings/InverterVoltageTooHighFault", String(inverter.InverterVoltageTooHighFault));
+        postMQTT("Warnings/OverTemperatureFault", String(inverter.OverTemperatureFault));
+        postMQTT("Warnings/fanLockedFault", String(inverter.fanLockedFault));
+        postMQTT("Warnings/BatteryVoltageToHighFault", String(inverter.BatteryVoltageToHighFault));
+        postMQTT("Warnings/BatteryLowAlarmWarning", String(inverter.BatteryLowAlarmWarning));
+        postMQTT("Warnings/BatteryUnderShutdownWarning", String(inverter.BatteryUnderShutdownWarning));
+        postMQTT("Warnings/OverloadFault", String(inverter.OverloadFault));
+        postMQTT("Warnings/EEPROMFault", String(inverter.EEPROMFault));
+        postMQTT("Warnings/InverterOverCurrentFault", String(inverter.InverterOverCurrentFault));
+        postMQTT("Warnings/InverterSoftFailFault", String(inverter.InverterSoftFailFault));
+        postMQTT("Warnings/SelfTestFailFault", String(inverter.SelfTestFailFault));
+        postMQTT("Warnings/OPDCvoltageOverFault", String(inverter.OPDCvoltageOverFault));
+        postMQTT("Warnings/BatOpenFault", String(inverter.BatOpenFault));
+        postMQTT("Warnings/CurrentSensorFailFault", String(inverter.CurrentSensorFailFault));
+        postMQTT("Warnings/BatteryShortFault", String(inverter.BatteryShortFault));
+        postMQTT("Warnings/PowerLimitWarning", String(inverter.PowerLimitWarning));
+        postMQTT("Warnings/PVVoltageHighWarning", String(inverter.PVVoltageHighWarning));
+        postMQTT("Warnings/MPPTOverloadFault", String(inverter.MPPTOverloadFault));
+        postMQTT("Warnings/MPPTOverloadWarning", String(inverter.MPPTOverloadWarning));
+        postMQTT("Warnings/BatteryTooLowToChargeWarning", String(inverter.BatteryTooLowToChargeWarning));
+    }
+}
